@@ -2,8 +2,6 @@ using Test
 using LazySets
 using LinearAlgebra
 using ModelVerification
-include("../src/QuantizedZonotopeVerification.jl")
-using .QuantizedZonotopeVerification
 
 @testset "Quantization Error Zonotope" begin
 

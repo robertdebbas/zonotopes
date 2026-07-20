@@ -15,13 +15,13 @@ Propagate an input through the network with real-valued (non-quantized) computat
 # Returns
 - `Vector{Float64}`: Network output
 """
-function propagate(net::Network, x::Vector{Float64})
+function propagate(net::Network, x::Vector{Float64}; cub_real::Float64=Inf)
     z = x
     for (i, layer) in enumerate(net.layers)
         z = layer.weights * z .+ layer.bias
 
         if isa(layer.activation, ReLU)
-            z = max.(z, 0.0)
+            z = clamp.(z, 0.0, cub_real)
 
         elseif isa(layer.activation, Id)
         else
@@ -67,7 +67,7 @@ function propagate_quantized(net::Network, quant_config, x::Vector{Float64})
         z = first_factor * Wq * z .+ factor * bq
 
         if isa(layer.activation, ReLU)
-            z = clamp.(z, 0.0, (2.0 ^ bits_activations) - 1)
+            z = clamp.(round.(z), 0.0, (2.0 ^ bits_activations) - 1)
         elseif isa(layer.activation, Id)
         else
             error("Unsupported activation type in quantized pass")
@@ -102,19 +102,15 @@ Used as a baseline for comparison with the sound zonotope-based method.
 """
 function sample_error_bounds(net::Network, quant_config::Dict, input::Vector{Float64}, radius::Float64; num_samples::Int=2)
     d = length(input)
-    println("Input dimension: $d")
-    println("Input center: ", input)
-    println("Sampling radius: ", radius)
-    println("Number of samples: ", num_samples)
-
     output_dim = length(net.layers[end].bias)
-    println("Network output dimension: ", output_dim)
-
     diffs = zeros(num_samples, output_dim)
+
+    strat_activations, bits_activations, scaling_activations = quant_config[:activations]
+    cub_real = (2.0^bits_activations - 1.0) / 2.0^scaling_activations
 
     for i in 1:num_samples
         point = input .+ radius .* (2 .* rand(d) .- 1)
-        y = propagate(net, point)
+        y = propagate(net, point; cub_real=cub_real)
         y_q = propagate_quantized(net, quant_config, point)
         diff = y_q .- y
 

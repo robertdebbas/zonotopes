@@ -4,7 +4,7 @@ module QuantizedZonotopeVerification
 include("utils/conversions.jl")
 include("core/quantization.jl")
 include("core/abstractions.jl")
-include("core/quantized_propagation.jl")
+include("core/propagation.jl")
 include("core/sampling.jl")
 
 # Utilities
@@ -12,7 +12,11 @@ include("utils/network_io.jl")
 
 # Export main functions
 export quantize_zonotope,
+       propagate_dnn,
+       propagate_qnn,
        quantization_error_zonotope,
+       quantization_error_constrained_zonotope,
+       concretize_error_zonotope,
        box_to_zonotope,
        quantize_tensor,
        zonotope_to_box,
@@ -24,9 +28,7 @@ export quantize_zonotope,
        ReLU,
        Id,
        abstract_relu,
-       abstract_relu_triplet,
        abstract_round_clamp,
-       abstract_round_clamp_triplet,
        sample_error_bounds,
        propagate_quantized,
        propagate,

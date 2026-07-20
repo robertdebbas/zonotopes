@@ -1,261 +1,130 @@
 using LazySets
 using LinearAlgebra
 
-function abstract_relu(Z::Zonotope)
+"""
+    abstract_relu(Z::Zonotope; output=:zonotope) -> Zonotope | (lambda, mu, E)
+
+Abstract ReLU transformer over a zonotope using the standard triangle relaxation.
+
+- `output=:zonotope` — returns a Zonotope with n new error generators appended
+- `output=:triplet`  — returns (lambda, mu, E): diagonal n×n matrices and n-vector
+"""
+function abstract_relu(Z::Zonotope; output::Symbol=:zonotope)
     c = Z.center
     G = Z.generators
-
     n = length(c)
-    m = size(G, 2)
 
-    new_c = similar(c)
-    new_G = zeros(n, m + n)  
+    lambda = zeros(Float64, n, n)
+    mu     = zeros(Float64, n)
+    E      = zeros(Float64, n, n)
 
     for i in 1:n
         sum_abs = sum(abs.(G[i, :]))
-
         l = c[i] - sum_abs
         u = c[i] + sum_abs
 
-        if u <= 0
-            new_c[i] = 0.0
-            new_G[i, :] .= 0.0
-
-        elseif l >= 0
-            new_c[i] = c[i]
-            new_G[i, 1:m] = G[i, :]
-
+        if u <= 0.0
+            # Dead neuron — lambda=0, mu=0, E=0 (already)
+        elseif l >= 0.0
+            lambda[i, i] = 1.0
         else
             a = u / (u - l)
             b = -u * l / (u - l)
-
-            new_c[i] = a * c[i] + b / 2
-            new_G[i, 1:m] = a * G[i, :]
-            new_G[i, m+i] = b / 2
+            lambda[i, i] = a
+            mu[i]        = b / 2
+            E[i, i]      = b / 2
         end
     end
 
-    return Zonotope(new_c, new_G)
+    output == :triplet && return lambda, mu, E
+    return Zonotope(lambda * c + mu, hcat(lambda * G, E))
 end
 
 """
-    abstract_relu_triplet(Z::Zonotope) -> (lambda, mu, E)
+    abstract_round_clamp(Z::Zonotope, Cub::Int; output=:zonotope) -> Zonotope | (lambda, mu, E)
 
-Compute the abstract ReLU transformation in triplet form for error propagation.
+Abstract transformer for rc(x) = clamp(round(x), 0, Cub) over a zonotope.
+Case boundaries match the paper spec: -0.5 and Cub+0.5.
 
-This function computes the abstract interpretation of the ReLU activation over a zonotope,
-returning the transformation as a triplet (λ, μ, E) where the output can be expressed as
-λZ + μ + E·ε, with ε ∈ [-1,1]ⁿ.
+Cases (based on interval [l, u] of each neuron):
+  1. u ≤ -0.5          → constant 0
+  2. l ≥ Cub+0.5       → constant Cub
+  3. -0.5 ≤ l, u ≤ Cub+0.5  → identity ± 0.5 rounding error (3a: constant if round(l)=round(u))
+  4. l ≤ -0.5, u ≥ Cub+0.5  → full-range affine relaxation
+  5. l ≤ -0.5, u ≤ Cub+0.5  → crosses lower threshold only
+  6. l ≥ -0.5, u ≥ Cub+0.5  → crosses upper threshold only
 
-# Arguments
-- `Z::Zonotope`: Input zonotope representing the pre-activation values
-
-# Returns
-- `lambda::Matrix{Float64}`: Diagonal matrix (n×n) of slopes for the linear approximation
-- `mu::Vector{Float64}`: Bias vector (n,) for the affine transformation
-- `E::Matrix{Float64}`: Diagonal matrix (n×n) of error generators
-
-# Algorithm
-For each dimension i with interval [l, u]:
-- If u ≤ 0: Neuron always off → λ=0, μ=0, E=0
-- If l ≥ 0: Neuron always on → λ=1, μ=0, E=0
-- Otherwise: Use triangle relaxation → λ=u/(u-l), with error term
+- `output=:zonotope` — returns a Zonotope with n new error generators appended
+- `output=:triplet`  — returns (lambda, mu, E): diagonal n×n matrices and n-vector
 """
-function abstract_relu_triplet(Z::Zonotope)
-    c = Z.center
-    G = Z.generators
-
-    n = length(c)
-    m = size(G, 2)
+function abstract_round_clamp(Z::Zonotope{Float64}, Cub::Int64; output::Symbol=:zonotope)
+    c  = Z.center
+    G  = Z.generators
+    n  = length(c)
+    Cf = float(Cub)
 
     lambda = zeros(Float64, n, n)
-    mu = zeros(Float64, n)
-    E = zeros(Float64, n, n)
-
-    for i in 1:n
-        sum_abs = sum(abs.(G[i, :]))
-
-        l = c[i] - sum_abs
-        u = c[i] + sum_abs
-
-        if u <= 0
-            lambda[i, i] = 0.0
-            mu[i] = 0.0
-
-        elseif l >= 0
-            lambda[i, i] = 1.0
-            mu[i] = 0.0
-
-        else
-            a = u / (u - l)
-            b = -u * l / (u - l)
-
-            lambda[i, i] = a
-            mu[i] = b / 2
-            E[i, i] = b / 2
-        end
-    end
-
-    return lambda, mu, E
-end
-
-function abstract_round_clamp(Z::Zonotope{Float64}, Cub::Float64)
-    c = Z.center
-    G = Z.generators
-
-    n = length(c)
-    m = size(G, 2)
-
-    new_c = similar(c)
-    new_G = zeros(Float64, n, m + n)
+    mu     = zeros(Float64, n)
+    E      = zeros(Float64, n, n)
 
     for i in 1:n
         sum_abs = sum(abs.(G[i, :]))
         l = c[i] - sum_abs
         u = c[i] + sum_abs
 
-        if u <= 0
-            new_c[i] = 0.0
+        if u <= -0.5
+            # Case 1: fully below — output = 0 (lambda=0, mu=0 by default)
 
-        elseif l >= Cub
-            new_c[i] = Cub
+        elseif l >= Cf + 0.5
+            # Case 2: fully above — output = Cub
+            mu[i] = Cf
 
-        elseif 0 <= l && u <= Cub
-            new_c[i] = c[i]
-            new_G[i, 1:m] .= G[i, :]
-            new_G[i, m + i] = 0.5
-
-        elseif l <= 0 && Cub <= u
-
-            if (Cub - l <= u && Cub - l >= 0.5) || (u <= Cub - l && l >= -0.5)
-                a = Cub / (u - 0.5)
+        elseif l >= -0.5 && u <= Cf + 0.5
+            # Case 3: within clamp bounds — abstract rounding only
+            rl = round(l)
+            ru = round(u)
+            if rl == ru
+                # Case 3a: constant — no rounding threshold crossed
+                mu[i] = rl
             else
-                a = Cub / (Cub - l - 0.5)
+                # Case 3b: identity with ±0.5 rounding error
+                lambda[i, i] = 1.0
+                E[i, i]      = 0.5
             end
 
-            b1 = max(-a * l, Cub - a * (Cub - 0.5))
-            b2 = min(-0.5 * a, Cub - a * u)
+        elseif l <= -0.5 && u >= Cf + 0.5
+            # Case 4: full range — both lower and upper thresholds crossed
+            lam1 = Cf / (u - 0.5)
+            lam2 = Cf / (Cf - l - 0.5)
+            a    = Cf - l <= u ? lam1 : lam2
+            b1   = max(-a * l, Cf - a * (Cf - 0.5))
+            b2   = min(-0.5 * a, Cf - a * u)
+            lambda[i, i] = a
+            mu[i]        = (b1 + b2) / 2
+            E[i, i]      = (b1 - b2) / 2
 
-            new_c[i] = a * c[i] + (b1 + b2) / 2
-            new_G[i, 1:m] .= a * G[i, :]
-            new_G[i, m + i] = (b1 - b2) / 2
-
-        elseif l <= 0 && u <= Cub
+        elseif l <= -0.5
+            # Case 5: crosses lower threshold only (u < Cub+0.5 by elimination)
             ru = round(u)
-
-            a = ru / (ru - l - 0.5)
-            b1 = -ru * l / (ru - 0.5 - l)
-            b2 = 0.5 * ru / (ru - l - 0.5)
-
-            new_c[i] = a * c[i] + (b1 + b2) / 2
-            new_G[i, 1:m] .= a * G[i, :]
-            new_G[i, m + i] = (b1 - b2) / 2
+            a  = ru / (ru - l - 0.5)
+            b1 = -a * l          # = -λ̂ l
+            b2 = -a / 2          # = -λ̂/2
+            lambda[i, i] = a
+            mu[i]        = (b1 + b2) / 2
+            E[i, i]      = (b1 - b2) / 2
 
         else
+            # Case 6: crosses upper threshold only (l >= -0.5 by elimination)
             rl = round(l)
-
-            a = (Cub - rl) / (u - rl - 0.5)
-            b1 = Cub - a * (Cub - 0.5)
-            b2 = Cub - a * u
-
-            new_c[i] = a * c[i] + (b1 + b2) / 2
-            new_G[i, 1:m] .= a * G[i, :]
-            new_G[i, m + i] = (b1 - b2) / 2
+            a  = (Cf - rl) / (u - rl - 0.5)
+            b1 = Cf - a * (Cf - 0.5)
+            b2 = Cf - a * u
+            lambda[i, i] = a
+            mu[i]        = (b1 + b2) / 2
+            E[i, i]      = (b1 - b2) / 2
         end
     end
 
-    return Zonotope(new_c, new_G)
-end
-
-"""
-    abstract_round_clamp_triplet(Z::Zonotope{Float64}, Cub::Int64) -> (lambda, mu, E)
-
-Compute the abstract round-and-clamp transformation in triplet form for quantized activations.
-
-This function abstracts the combined rounding and clamping operation that occurs in
-quantized neural networks: clamp(round(x), 0, Cub). It returns a triplet (λ, μ, E)
-similar to abstract_relu_triplet.
-
-# Arguments
-- `Z::Zonotope{Float64}`: Input zonotope representing pre-quantization activation values
-- `Cub::Int64`: Upper bound for clamping (e.g., 2^bits - 1)
-
-# Returns
-- `lambda::Matrix{Float64}`: Diagonal matrix (n×n) of slopes
-- `mu::Vector{Float64}`: Bias vector (n,)
-- `E::Matrix{Float64}`: Diagonal matrix (n×n) of error generators
-
-# Algorithm
-For each dimension with interval [l, u], handles multiple cases:
-- Fully below 0 or above Cub: Constant output
-- Fully within [0, Cub]: Identity with rounding error (±0.5)
-- Spanning boundaries: Affine relaxation with appropriate error bounds
-"""
-function abstract_round_clamp_triplet(Z::Zonotope{Float64}, Cub::Int64)
-    c = Z.center
-    G = Z.generators
-
-    n = length(c)
-    m = size(G, 2)
-
-    lambda = zeros(Float64, n, n)
-    mu = zeros(Float64, n)
-    E = zeros(Float64, n, n)
-
-    for i in 1:n
-        sum_abs = sum(abs.(G[i, :]))
-        l = c[i] - sum_abs
-        u = c[i] + sum_abs
-
-        if u <= 0
-            lambda[i, i] = 0.0
-            mu[i] = 0.0
-
-        elseif l >= Cub
-            lambda[i, i] = 0.0
-            mu[i] = Cub
-
-        elseif 0 <= l && u <= Cub
-            lambda[i, i] = 1.0
-            mu[i] = 0.0
-            E[i, i] = 0.5
-
-        elseif l <= 0 && Cub <= u
-            if (Cub - l <= u && Cub - l >= 0.5) || (u <= Cub - l && l >= -0.5)
-                a = Cub / (u - 0.5)
-            else
-                a = Cub / (Cub - l - 0.5)
-            end
-            b1 = max(-a * l, Cub - a * (Cub - 0.5))
-            b2 = min(-0.5 * a, Cub - a * u)
-
-            lambda[i, i] = a
-            mu[i] = (b1 + b2) / 2
-            E[i, i] = (b1 - b2) / 2
-
-        elseif l <= 0 && u <= Cub
-            ru = round(u)
-
-            a = ru / (ru - l - 0.5)
-            b1 = -ru * l / (ru - 0.5 - l)
-            b2 = 0.5 * ru / (ru - l - 0.5)
-
-            lambda[i, i] = a
-            mu[i] = (b1 + b2) / 2
-            E[i, i] = (b1 - b2) / 2
-
-        else
-            rl = round(l)
-
-            a = (Cub - rl) / (u - rl - 0.5)
-            b1 = Cub - a * (Cub - 0.5)
-            b2 = Cub - a * u
-
-            lambda[i, i] = a
-            mu[i] = (b1 + b2) / 2
-            E[i, i] = (b1 - b2) / 2
-        end
-    end
-
-    return lambda, mu, E
+    output == :triplet && return lambda, mu, E
+    return Zonotope(lambda * c + mu, hcat(lambda * G, E))
 end
