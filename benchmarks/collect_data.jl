@@ -18,7 +18,6 @@ const IN_LB   = [(IN_MIN[k] - IN_MEAN[k]) / IN_VAR[k] for k in 1:5]
 const IN_UB   = [(IN_MAX[k] - IN_MEAN[k]) / IN_VAR[k] for k in 1:5]
 
 function make_input_zonotope(X0, eps)
-    # Clip to physical bounds (matches QEBVerif's np.clip before integer conversion)
     x_lb = clamp.(X0 .- eps, IN_LB, IN_UB)
     x_ub = clamp.(X0 .+ eps, IN_LB, IN_UB)
     center = (x_lb .+ x_ub) ./ 2
@@ -33,13 +32,18 @@ let _net = load_acasxu_network_from_json("networks/acasxu_1_1.json"),
     for _Q in [6, 8, 10], _ in 1:2
         _qc = Dict(:input => ("pm",8,8), :weights => ("pm",_Q,_Q-2),
                    :biases => ("pm",_Q,_Q-2), :activations => ("p",_Q,_Q-2))
+        # Plain zonotope
         out_z = quantization_error_zonotope(_net, _qc, _z)
         _box  = overapproximate(out_z, Hyperrectangle)
         _     = mean((_box.center .+ _box.radius) .- (_box.center .- _box.radius))
-        lb_c, ub_c = quantization_error_constrained_zonotope(_net, _qc, _z; full_constraints=true)
-        _     = mean(ub_c .- lb_c)
-        lb_l, ub_l = quantization_error_constrained_zonotope(_net, _qc, _z; full_constraints=false)
+        # Constrained Light (no oblique, no diagonal)
+        lb_l, ub_l = quantization_error_constrained_zonotope(_net, _qc, _z;
+                        full_constraints=false, diagonal_constraints=false)
         _     = mean(ub_l .- lb_l)
+        # Constrained Complete (oblique + diagonal)
+        lb_c, ub_c = quantization_error_constrained_zonotope(_net, _qc, _z;
+                        full_constraints=true, diagonal_constraints=true)
+        _     = mean(ub_c .- lb_c)
     end
 end
 GC.gc(); GC.gc()
@@ -47,16 +51,16 @@ println("Warmup complete.")
 
 csv_path = "results/data/benchmark_results.csv"
 open(csv_path, "w") do f
-    println(f, "net_i,net_j,Q,r,eps,odiff_zono,time_zono,odiff_con,time_con,odiff_con_light,time_con_light")
+    println(f, "net_i,net_j,Q,r,eps,odiff_zono,time_zono,odiff_con_light,time_con_light,odiff_con_complete,time_con_complete")
 end
 
-total   = length(NETWORKS) * length(Q_VALUES) * length(RADII)
-n_done  = 0
+total  = length(NETWORKS) * length(Q_VALUES) * length(RADII)
+n_done = 0
 
 for (i, j) in NETWORKS
     println("Loading acasxu_$(i)_$(j) ...")
     net = load_acasxu_network_from_json("networks/acasxu_$(i)_$(j).json")
-    GC.gc()   # collect JSON-parsing garbage once per network, outside any timing
+    GC.gc()
 
     for Q in Q_VALUES
         qc = Dict(
@@ -65,13 +69,13 @@ for (i, j) in NETWORKS
             :biases      => ("pm", Q, Q - 2),
             :activations => ("p",  Q, Q - 2),
         )
-        GC.gc()   # collect between Q values; keeps per-experiment GC pressure low
+        GC.gc()
 
         for r in RADII
             eps        = r / 256.0
             input_zono = make_input_zonotope(X0, eps)
 
-            # Zonotope method
+            # Plain zonotope
             od_z = NaN; t_z = NaN
             try
                 t_z = @elapsed begin
@@ -83,34 +87,36 @@ for (i, j) in NETWORKS
                 @warn "Zonotope failed ($i,$j) Q=$Q r=$r: $e"
             end
 
-            # Constrained Zonotope (full — all oblique constraints)
-            od_c = NaN; t_c = NaN
-            try
-                t_c = @elapsed begin
-                    lb_c, ub_c = quantization_error_constrained_zonotope(net, qc, input_zono; full_constraints=true)
-                    od_c = mean(ub_c .- lb_c)
-                end
-            catch e
-                @warn "Constrained failed ($i,$j) Q=$Q r=$r: $e"
-            end
-
-            # Constrained Zonotope (light — box constraints only, no oblique)
+            # Constrained Light (no oblique, no diagonal)
             od_l = NaN; t_l = NaN
             try
                 t_l = @elapsed begin
-                    lb_l, ub_l = quantization_error_constrained_zonotope(net, qc, input_zono; full_constraints=false)
+                    lb_l, ub_l = quantization_error_constrained_zonotope(net, qc, input_zono;
+                                    full_constraints=false, diagonal_constraints=false)
                     od_l = mean(ub_l .- lb_l)
                 end
             catch e
-                @warn "Constrained light failed ($i,$j) Q=$Q r=$r: $e"
+                @warn "Constrained Light failed ($i,$j) Q=$Q r=$r: $e"
+            end
+
+            # Constrained Complete (oblique + diagonal)
+            od_c = NaN; t_c = NaN
+            try
+                t_c = @elapsed begin
+                    lb_c, ub_c = quantization_error_constrained_zonotope(net, qc, input_zono;
+                                    full_constraints=true, diagonal_constraints=true)
+                    od_c = mean(ub_c .- lb_c)
+                end
+            catch e
+                @warn "Constrained Complete failed ($i,$j) Q=$Q r=$r: $e"
             end
 
             global n_done += 1
-            @printf("[%d/%d] (%d,%d) Q=%d r=%d: Zono=%.3f (%.3fs) | Con=%.3f (%.3fs) | Light=%.3f (%.3fs)\n",
-                    n_done, total, i, j, Q, r, od_z, t_z, od_c, t_c, od_l, t_l)
+            @printf("[%d/%d] (%d,%d) Q=%d r=%d: Zono=%.3f (%.3fs) | Light=%.3f (%.3fs) | Complete=%.3f (%.3fs)\n",
+                    n_done, total, i, j, Q, r, od_z, t_z, od_l, t_l, od_c, t_c)
 
             open(csv_path, "a") do f
-                println(f, "$i,$j,$Q,$r,$eps,$od_z,$t_z,$od_c,$t_c,$od_l,$t_l")
+                println(f, "$i,$j,$Q,$r,$eps,$od_z,$t_z,$od_l,$t_l,$od_c,$t_c")
             end
         end
     end

@@ -44,15 +44,17 @@ end
     abstract_round_clamp(Z::Zonotope, Cub::Int; output=:zonotope) -> Zonotope | (lambda, mu, E)
 
 Abstract transformer for rc(x) = clamp(round(x), 0, Cub) over a zonotope.
-Case boundaries match the paper spec: -0.5 and Cub+0.5.
+`round` is Julia's round-to-nearest with ties to even.
 
-Cases (based on interval [l, u] of each neuron):
-  1. u ≤ -0.5          → constant 0
-  2. l ≥ Cub+0.5       → constant Cub
-  3. -0.5 ≤ l, u ≤ Cub+0.5  → identity ± 0.5 rounding error (3a: constant if round(l)=round(u))
-  4. l ≤ -0.5, u ≥ Cub+0.5  → full-range affine relaxation
-  5. l ≤ -0.5, u ≤ Cub+0.5  → crosses lower threshold only
-  6. l ≥ -0.5, u ≥ Cub+0.5  → crosses upper threshold only
+Cases, based on the interval [l, u] of each neuron and tested in this order
+(the first match applies, so the regions are disjoint):
+  1. u ≤ -0.5               → constant 0
+  2. l ≥ Cub+0.5            → constant Cub
+  3. -0.5 ≤ l, u ≤ Cub+0.5  → rounding only, with rl = round(l), ru = min(round(u), Cub):
+                              constant rl if rl = ru (3a), else identity ± 0.5 (3b)
+  4. l ≤ -0.5, u ≥ Cub+0.5  → both thresholds crossed
+  5. l < -0.5, u < Cub+0.5  → lower threshold crossed only
+  6. l > -0.5, u > Cub+0.5  → upper threshold crossed only
 
 - `output=:zonotope` — returns a Zonotope with n new error generators appended
 - `output=:triplet`  — returns (lambda, mu, E): diagonal n×n matrices and n-vector
@@ -82,7 +84,7 @@ function abstract_round_clamp(Z::Zonotope{Float64}, Cub::Int64; output::Symbol=:
         elseif l >= -0.5 && u <= Cf + 0.5
             # Case 3: within clamp bounds — abstract rounding only
             rl = round(l)
-            ru = round(u)
+            ru = min(round(u), Cf)   # u = Cub+0.5 may round up to Cub+1; output is clamped at Cub
             if rl == ru
                 # Case 3a: constant — no rounding threshold crossed
                 mu[i] = rl

@@ -15,13 +15,13 @@ Propagate an input through the network with real-valued (non-quantized) computat
 # Returns
 - `Vector{Float64}`: Network output
 """
-function propagate(net::Network, x::Vector{Float64}; cub_real::Float64=Inf)
+function propagate(net::Network, x::Vector{Float64})
     z = x
-    for (i, layer) in enumerate(net.layers)
+    for layer in net.layers
         z = layer.weights * z .+ layer.bias
 
         if isa(layer.activation, ReLU)
-            z = clamp.(z, 0.0, cub_real)
+            z = max.(z, 0.0)
 
         elseif isa(layer.activation, Id)
         else
@@ -58,9 +58,8 @@ function propagate_quantized(net::Network, quant_config, x::Vector{Float64})
     factor = 2.0 ^ scaling_activations
 
     for (i, layer) in enumerate(net.layers)
-
         first_factor = i == 1 ? factor : 1.0
-        
+
         Wq = quantize_tensor(layer.weights, scaling_weights, bits_weights)
         bq = quantize_tensor(layer.bias, scaling_biases, bits_biases)
 
@@ -80,7 +79,7 @@ end
     sample_error_bounds(net::Network, quant_config::Dict, input::Vector{Float64},
                        radius::Float64; num_samples::Int=2) -> (Vector{Float64}, Vector{Float64})
 
-Estimate quantization error bounds via random sampling (baseline method).
+Estimate the range of the quantization error by random sampling.
 
 Samples random points in the input region, computes both real-valued and quantized outputs,
 and returns the min/max quantization error observed across all samples.
@@ -93,24 +92,22 @@ and returns the min/max quantization error observed across all samples.
 - `num_samples::Int=2`: Number of random samples to draw
 
 # Returns
-- `mins::Vector{Float64}`: Lower bounds on quantization error per output dimension
-- `maxs::Vector{Float64}`: Upper bounds on quantization error per output dimension
+- `mins::Vector{Float64}`: Smallest observed error per output dimension
+- `maxs::Vector{Float64}`: Largest observed error per output dimension
 
 # Note
-This provides sound under-approximations: true error bounds may be wider.
-Used as a baseline for comparison with the sound zonotope-based method.
+The result is an inner estimate, not a sound bound: the true error range can be wider.
+It is useful as a sanity check, since every sampled error must lie inside the bounds
+returned by `quantization_error_zonotope`.
 """
 function sample_error_bounds(net::Network, quant_config::Dict, input::Vector{Float64}, radius::Float64; num_samples::Int=2)
     d = length(input)
     output_dim = length(net.layers[end].bias)
     diffs = zeros(num_samples, output_dim)
 
-    strat_activations, bits_activations, scaling_activations = quant_config[:activations]
-    cub_real = (2.0^bits_activations - 1.0) / 2.0^scaling_activations
-
     for i in 1:num_samples
         point = input .+ radius .* (2 .* rand(d) .- 1)
-        y = propagate(net, point; cub_real=cub_real)
+        y = propagate(net, point)
         y_q = propagate_quantized(net, quant_config, point)
         diff = y_q .- y
 

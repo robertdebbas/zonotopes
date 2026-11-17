@@ -30,7 +30,7 @@ function _relu_constraint_rows(
         u = c[i] + sum_abs
 
         # Dead (u≤0) or exact (l≥0) neurons need no relaxation constraint
-        u <= 0.0 || l >= 0.0 && continue
+        (u <= 0.0 || l >= 0.0) && continue
 
         λi = lambda[i, i]
         μi = mu[i]
@@ -57,13 +57,18 @@ end
 # encoding the complete convex-hull overapproximation per the paper spec.
 # Boundaries match abstract_round_clamp: -0.5 and Cub+0.5.
 #
-# Case 3b: 4 constraints (y≥rl, y≤ru, two oblique hull edges)
-# Case 4:  3 constraints (y≥0, y≤C, one oblique hull edge)
-# Case 5:  4 constraints (y≥0, y≤ru, y≥x-½, oblique lower at upper edge)
-# Case 6:  4 constraints (y≥rl, y≤C, y≤x+½, oblique upper at lower edge)
+# Case 3b: 2–4 constraints (y≥rl, y≤ru, [two oblique hull edges])
+# Case 4:  2–3 constraints (y≥0, y≤C, [one oblique hull edge])
+# Case 5:  2–4 constraints (y≥0, y≤ru, [y≥x-½], [oblique lower at upper edge])
+# Case 6:  2–4 constraints (y≥rl, y≤C, [y≤x+½], [oblique upper at lower edge])
+# oblique=false omits convex-hull edge constraints (slope 1/d).
+# Each oblique edge has run d ∈ [0, 1] and is written multiplied by d, so no division
+# is needed. At d = 0 the edge is vertical (x ≥ l or x ≤ u), which the bounds on ε
+# already imply, so that row is omitted.
+# diagonal=false additionally omits the slope-1 rounding bounds (y≥x-½, y≤x+½).
 function _rc_constraint_rows(
     Z_hat::Zonotope, lambda_hat, mu_hat, E_hat,
-    m_curr::Int, M::Int, Cub::Int; oblique::Bool=true
+    m_curr::Int, M::Int, Cub::Int; oblique::Bool=true, diagonal::Bool=true
 )
     c  = Z_hat.center
     G  = Z_hat.generators   # n × m_curr
@@ -89,7 +94,7 @@ function _rc_constraint_rows(
 
         elseif l >= -0.5 && u <= Cf + 0.5
             # Case 3
-            rl = round(l); ru = round(u)
+            rl = round(l); ru = min(round(u), Cf)   # matches abstract_round_clamp
             rl == ru && continue   # Case 3a: constant
 
             # Case 3b: λ̂=1, μ̂=0, ê=0.5 — 4 constraints
@@ -103,19 +108,17 @@ function _rc_constraint_rows(
 
             if oblique
                 d1 = rl + 0.5 - l                               # upper hull at left edge
-                if d1 > 0.05
-                    lm1 = 1.0 / d1; mm1 = rl - lm1 * l
-                    nrow += 1
-                    A[nrow, 1:m_curr] .= (lm1 - 1.0) .* G[i, :]; A[nrow, m_curr+i] = -0.5
-                    b[nrow] = (lm1 - 1.0) * vi + mm1
+                if d1 > 0.0
+                    nrow += 1                                    # (x−l) − d1·(y−rl) ≥ 0
+                    A[nrow, 1:m_curr] .= (1.0 - d1) .* G[i, :]; A[nrow, m_curr+i] = -0.5 * d1
+                    b[nrow] = (1.0 - d1) * vi - l + d1 * rl
                 end
 
                 d2 = u + 0.5 - ru                               # lower hull at right edge
-                if d2 > 0.05
-                    lm2 = 1.0 / d2; mm2 = ru - lm2 * u
-                    nrow += 1
-                    A[nrow, 1:m_curr] .= (1.0 - lm2) .* G[i, :]; A[nrow, m_curr+i] = 0.5
-                    b[nrow] = (1.0 - lm2) * vi - mm2
+                if d2 > 0.0
+                    nrow += 1                                    # d2·(y−ru) − (x−u) ≥ 0
+                    A[nrow, 1:m_curr] .= (d2 - 1.0) .* G[i, :]; A[nrow, m_curr+i] = 0.5 * d2
+                    b[nrow] = (d2 - 1.0) * vi - d2 * ru + u
                 end
             end
 
@@ -156,18 +159,18 @@ function _rc_constraint_rows(
             A[nrow, 1:m_curr] .= -λi .* G[i, :]; A[nrow, m_curr+i] = -ei
             b[nrow] = ru - λi * vi - μi                          # y_hat ≤ ru
 
-            nrow += 1
-            A[nrow, 1:m_curr] .= (λi - 1.0) .* G[i, :]; A[nrow, m_curr+i] = ei
-            b[nrow] = (λi - 1.0) * vi + μi + 0.5                # y_hat ≥ x−½
+            if diagonal
+                nrow += 1
+                A[nrow, 1:m_curr] .= (λi - 1.0) .* G[i, :]; A[nrow, m_curr+i] = ei
+                b[nrow] = (λi - 1.0) * vi + μi + 0.5            # y_hat ≥ x−½
+            end
 
             if oblique
                 d_star = u - ru + 0.5
-                if d_star > 0.05
-                    lam_star = 1.0 / d_star
-                    mu_star  = ru - lam_star * u
-                    nrow += 1
-                    A[nrow, 1:m_curr] .= (λi - lam_star) .* G[i, :]; A[nrow, m_curr+i] = ei
-                    b[nrow] = (μi - mu_star) + (λi - lam_star) * vi
+                if d_star > 0.0
+                    nrow += 1                                    # d·(y−ru) − (x−u) ≥ 0
+                    A[nrow, 1:m_curr] .= (d_star * λi - 1.0) .* G[i, :]; A[nrow, m_curr+i] = d_star * ei
+                    b[nrow] = (d_star * λi - 1.0) * vi + d_star * (μi - ru) + u
                 end
             end
 
@@ -183,18 +186,18 @@ function _rc_constraint_rows(
             A[nrow, 1:m_curr] .= -λi .* G[i, :]; A[nrow, m_curr+i] = -ei
             b[nrow] = Cf - λi * vi - μi                          # y_hat ≤ C
 
-            nrow += 1
-            A[nrow, 1:m_curr] .= (1.0 - λi) .* G[i, :]; A[nrow, m_curr+i] = -ei
-            b[nrow] = (1.0 - λi) * vi - μi + 0.5                # y_hat ≤ x+½
+            if diagonal
+                nrow += 1
+                A[nrow, 1:m_curr] .= (1.0 - λi) .* G[i, :]; A[nrow, m_curr+i] = -ei
+                b[nrow] = (1.0 - λi) * vi - μi + 0.5            # y_hat ≤ x+½
+            end
 
             if oblique
                 d_star = rl - l + 0.5
-                if d_star > 0.05
-                    lam_star = 1.0 / d_star
-                    mu_star  = rl - lam_star * l
-                    nrow += 1
-                    A[nrow, 1:m_curr] .= (lam_star - λi) .* G[i, :]; A[nrow, m_curr+i] = -ei
-                    b[nrow] = (mu_star - μi) + (lam_star - λi) * vi
+                if d_star > 0.0
+                    nrow += 1                                    # (x−l) − d·(y−rl) ≥ 0
+                    A[nrow, 1:m_curr] .= (1.0 - d_star * λi) .* G[i, :]; A[nrow, m_curr+i] = -d_star * ei
+                    b[nrow] = (1.0 - d_star * λi) * vi - l - d_star * (μi - rl)
                 end
             end
         end
@@ -214,6 +217,9 @@ end
 Solve one LP per output dimension (min and max) to obtain tight bounds on the
 quantization error zonotope `Z_tilda`, subject to linear constraints
 `A_con * ε + b_con ≥ 0` and `ε ∈ [-1, 1]^M`.
+
+Each LP has a 2-second time limit. If a solve does not finish with an optimal
+status, the plain zonotope bound is used for that output: looser, but still sound.
 """
 function concretize_error_zonotope(
     Z_tilda::Zonotope,
@@ -337,18 +343,20 @@ end
 
 Propagate the quantized network using the abstract round-clamp transformer.
 
+The input is quantized via `quantize_zonotope`, producing an axis-aligned zonotope
+with m0 generators (same count as the DNN input).
+
 Returns `(Z, A, b)`:
-- `Z`:  output zonotope (descaled to real domain)
-- `A`, `b`: constraint rows `A * ε + b ≥ 0` from the round-clamp convex-hull;
-  empty matrices/vectors when `constrained=false`.
-  `full_constraints=false` omits the oblique hull edges (box constraints only).
+- `Z`:  output zonotope (descaled to real domain), with m0 + Σn_k generators
+- `A`, `b`: constraint rows `A * ε + b ≥ 0` (empty when `constrained=false`)
 """
 function propagate_qnn(
     net::Network,
     quant_config,
     input_zonotope::Zonotope;
-    constrained::Bool      = false,
-    full_constraints::Bool = true
+    constrained::Bool           = false,
+    full_constraints::Bool      = true,
+    diagonal_constraints::Bool  = true
 )
     layers = net.layers
     N = length(layers)
@@ -368,6 +376,7 @@ function propagate_qnn(
     )
 
     Z = quantize_zonotope(input_zonotope, scaling_input, bits_input)
+
     A_chunks = Vector{Matrix{Float64}}()
     b_chunks = Vector{Vector{Float64}}()
     m_curr = m0
@@ -387,7 +396,8 @@ function propagate_qnn(
             if constrained
                 A_rc, b_rc = _rc_constraint_rows(
                     Z, lambda_hat, mu_hat, E_hat, m_curr, M, Cub;
-                    oblique = full_constraints
+                    oblique  = full_constraints,
+                    diagonal = diagonal_constraints
                 )
                 if length(b_rc) > 0
                     push!(A_chunks, A_rc)
@@ -412,40 +422,66 @@ end
 
 """
     quantization_error_zonotope(net, quant_config, input_zonotope;
-                                constrained=false, full_constraints=true)
+                                constrained=false, full_constraints=true,
+                                diagonal_constraints=true)
 
 Compute the quantization error between the QNN and DNN by propagating each
-network separately and subtracting their output zonotopes.
+network independently (Minkowski-sum approach) and forming the error zonotope.
 
-- `constrained=false`: returns the error `Zonotope` (same as the previous
-  unconstrained formulation).
-- `constrained=true`: additionally accumulates ReLU and round-clamp linear
-  constraints during propagation, then solves one LP per output dimension to
-  obtain tight `(lower, upper)` bound vectors.
-- `full_constraints=true` (only used when `constrained=true`): includes
-  oblique hull edges for the round-clamp; `false` uses box constraints only.
+Symbol spaces (independent):
+  DNN: ε^(N)  ∈ [-1,1]^M,   M = d + Σn_k
+  QNN: ε̂^(N) ∈ [-1,1]^M
+
+Extended space: (ε̂^(N), ε^(N)) ∈ [-1,1]^{2M}.
+Generator matrix: [G_qnn | -G_dnn].
+
+Constraints are lifted block-diagonally: QNN constraints act on columns 1:M,
+DNN constraints act on columns M+1:2M.
+
+Returns the error `Zonotope` when `constrained=false`, and `(lower, upper)` bound
+vectors when `constrained=true`. `full_constraints` and `diagonal_constraints`
+select the complete round-clamp constraints (both `true`) or the light variant
+(both `false`). The constrained mode expects a box-shaped input zonotope with one
+generator per input dimension.
 """
 function quantization_error_zonotope(
     net::Network,
     quant_config,
     input_zonotope::Zonotope;
-    constrained::Bool      = false,
-    full_constraints::Bool = true
+    constrained::Bool          = false,
+    full_constraints::Bool     = true,
+    diagonal_constraints::Bool = true
 )
     Z_dnn, A_dnn, b_dnn = propagate_dnn(net, quant_config, input_zonotope;
                                          constrained)
     Z_qnn, A_qnn, b_qnn = propagate_qnn(net, quant_config, input_zonotope;
-                                         constrained, full_constraints)
+                                         constrained, full_constraints, diagonal_constraints)
 
-    Z_tilda = Zonotope(Z_qnn.center - Z_dnn.center, genmat(Z_qnn) - genmat(Z_dnn))
+    G_qnn = genmat(Z_qnn)   # (n_out, M)
+    G_dnn = genmat(Z_dnn)   # (n_out, M)
+    M     = size(G_dnn, 2)
 
+    G_tilda = hcat(G_qnn, -G_dnn)
+    Z_tilda = Zonotope(Z_qnn.center - Z_dnn.center, G_tilda)
     constrained || return Z_tilda
 
-    A_con = sparse(vcat(A_dnn, A_qnn))
-    b_con = vcat(b_dnn, b_qnn)
+    n_qnn = size(A_qnn, 1)
+    n_dnn = size(A_dnn, 1)
+
+    # QNN constraints act on first M columns; DNN on last M columns.
+    A_qnn_ext = n_qnn > 0 ?
+        hcat(A_qnn, zeros(Float64, n_qnn, M)) :
+        zeros(Float64, 0, 2M)
+
+    A_dnn_ext = n_dnn > 0 ?
+        hcat(zeros(Float64, n_dnn, M), A_dnn) :
+        zeros(Float64, 0, 2M)
+
+    A_con = sparse(vcat(A_qnn_ext, A_dnn_ext))
+    b_con = vcat(b_qnn, b_dnn)
     return concretize_error_zonotope(Z_tilda, A_con, b_con)
 end
 
 # Backward-compatibility alias
-quantization_error_constrained_zonotope(net, qc, z; full_constraints=true, method=:lp) =
-    quantization_error_zonotope(net, qc, z; constrained=true, full_constraints)
+quantization_error_constrained_zonotope(net, qc, z; full_constraints=true, diagonal_constraints=true, method=:lp) =
+    quantization_error_zonotope(net, qc, z; constrained=true, full_constraints, diagonal_constraints)

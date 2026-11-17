@@ -1,8 +1,8 @@
 """
 Runs QEBVerif's DRA-Sym (IPVerifier, mode=Sym) on all 150 benchmark experiments.
 
-Run from anywhere with the qebverif-env activated:
-  source ~/qebverif-env/bin/activate
+Run from anywhere, in a Python environment with TensorFlow 2, gurobipy and numpy
+(see QEBVerif/README.md; a Gurobi license is required):
   python benchmarks/collect_drasym_official.py
 
 Outputs: results/data/drasym_results.csv
@@ -11,7 +11,8 @@ Outputs: results/data/drasym_results.csv
 import os, sys, csv, time
 
 # Must run from the QEBVerif directory so relative imports work
-QEBVERIF_DIR = "/Users/robertdebbas/Desktop/Intern:Projects/zonotopes/QEBVerif"
+REPO_ROOT    = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+QEBVERIF_DIR = os.path.join(REPO_ROOT, "QEBVerif")
 os.chdir(QEBVERIF_DIR)
 sys.path.insert(0, QEBVERIF_DIR)
 
@@ -19,7 +20,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 os.environ["METAL_LOG_LEVEL"] = "0"
 
 import numpy as np
-import tensorflow as tf
 import gurobipy as gp
 
 # Suppress Gurobi console output
@@ -38,63 +38,46 @@ PROPERTY  = 4
 N_OUT     = 5
 
 H5_DIR  = "benchmark/acasxu"
-OUT_CSV = "/Users/robertdebbas/Desktop/Intern:Projects/zonotopes/results/data/drasym_results.csv"
+OUT_CSV = os.path.join(REPO_ROOT, "results", "data", "drasym_results.csv")
 
-# ── Input normalisation bounds (from QEBVerif) ───────────────────────────────
-in_min  = [0.0,     -3.141593, -3.141593, 100.0,  0.0]
-in_max  = [60760.0,  3.141593,  3.141593, 1200.0, 1200.0]
-in_mean = [1.9791091e+04, 0.0,  0.0,      650.0,  600.0]
-in_var  = [60261.0,  6.28318530718, 6.28318530718, 1100.0, 1200.0]
+# ── ACAS Xu input normalisation (same constants as collect_data.jl) ──────────
+IN_MIN  = np.array([0.0,      -3.141593, -3.141593, 100.0,   0.0])
+IN_MAX  = np.array([60760.0,   3.141593,  3.141593, 1200.0, 1200.0])
+IN_MEAN = np.array([1.9791091e4, 0.0,     0.0,       650.0,  600.0])
+IN_VAR  = np.array([60261.0,  6.28318530718, 6.28318530718, 1100.0, 1200.0])
+IN_LB   = (IN_MIN - IN_MEAN) / IN_VAR
+IN_UB   = (IN_MAX - IN_MEAN) / IN_VAR
 
-IN_UB = [(in_max[k] - in_mean[k]) / in_var[k] for k in range(5)]
-IN_LB = [(in_min[k] - in_mean[k]) / in_var[k] for k in range(5)]
+# Inputs are signed 8-bit fixed-point values with 8 fractional bits
+INPUT_BITS       = 8
+INT_MIN, INT_MAX = int_get_min_max_integer(INPUT_BITS, INPUT_BITS)
 
-input_min_v,   input_max_v   = int_get_min_max(8, 8)
-input_min_int, input_max_int = int_get_min_max_integer(8, 8)
-
-
-def ij_to_acasnet(i, j):
-    """Map (i,j) network index to QEBVerif's --AcasNet integer."""
-    if j == 9:
-        return i * 9          # j_index=0 branch: file = (i_index, 9)
-    else:
-        return (i - 1) * 9 + j  # file = (i_index+1, j_index)
+LAYER_SIZES = [50] * 6 + [N_OUT]
 
 
-def h5_path(acasnet):
-    i_index = acasnet // 9
-    j_index = acasnet - i_index * 9
-    if j_index == 0:
-        return f"{H5_DIR}/ACASXU_run2a_{i_index}_{9}_batch_2000.h5"
-    else:
-        return f"{H5_DIR}/ACASXU_run2a_{i_index + 1}_{j_index}_batch_2000.h5"
+def weights_file(i, j):
+    """Path of the Keras weights of ACAS Xu network (i, j), relative to QEBVerif/."""
+    return f"{H5_DIR}/ACASXU_run2a_{i}_{j}_batch_2000.h5"
 
 
-def build_model(Q, weight_path):
-    """Build, compile and load a QuantizedModel for the given Q."""
-    m = QuantizedModel(
-        [50, 50, 50, 50, 50, 50, 5],
-        input_bits=8,
-        quantization_bits=Q,
-        last_layer_signed=True,
-    )
-    m.compile(
-        optimizer=tf.keras.optimizers.Adam(0.0001),
-        loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True),
-        metrics=[tf.keras.metrics.SparseCategoricalAccuracy()],
-    )
-    m.build((None, 5))
-    m.load_weights(weight_path)
-    return m
+def load_model(Q, weight_path):
+    """QEBVerif model of an ACAS Xu network quantized to Q bits."""
+    model = QuantizedModel(LAYER_SIZES, input_bits=INPUT_BITS,
+                           quantization_bits=Q, last_layer_signed=True)
+    model.build((None, len(X0)))
+    model.load_weights(weight_path)
+    return model
 
 
 def input_bounds(eps):
-    """Convert real-domain eps to QEBVerif integer input bounds."""
-    x_ub = [np.clip(X0[k] + eps, IN_LB[k], IN_UB[k]) for k in range(5)]
-    x_lb = [np.clip(X0[k] - eps, IN_LB[k], IN_UB[k]) for k in range(5)]
-    ub_int = np.array([np.clip(real_round(x * 256), input_min_int, input_max_int) for x in x_ub])
-    lb_int = np.array([np.clip(real_round(x * 256), input_min_int, input_max_int) for x in x_lb])
-    return lb_int, ub_int
+    """Integer bounds of the input box X0 ± eps, clipped to the valid input domain."""
+    def to_fixed_point(x):
+        return np.clip([real_round(v * 2 ** INPUT_BITS) for v in x], INT_MIN, INT_MAX)
+
+    center = np.array(X0)
+    lower  = np.clip(center - eps, IN_LB, IN_UB)
+    upper  = np.clip(center + eps, IN_LB, IN_UB)
+    return to_fixed_point(lower), to_fixed_point(upper)
 
 
 def run_drasym(model, lb_int, ub_int):
@@ -126,12 +109,11 @@ if __name__ == "__main__":
         writer.writerow(["net_i", "net_j", "Q", "r", "eps", "odiff_drasym", "time_drasym"])
 
         for (ni, nj) in NETWORKS:
-            acasnet = ij_to_acasnet(ni, nj)
-            wp      = h5_path(acasnet)
-            print(f"Network ({ni},{nj})  [AcasNet={acasnet}]  weights: {wp}")
+            wp = weights_file(ni, nj)
+            print(f"Network ({ni},{nj})  weights: {wp}")
 
             for Q in Q_VALUES:
-                model = build_model(Q, wp)
+                model = load_model(Q, wp)
 
                 for r in RADII:
                     eps = r / 256.0

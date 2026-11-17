@@ -1,259 +1,194 @@
 # Quantized Zonotope Verification
 
-A sound and efficient method for verifying quantized neural networks using zonotope-based abstract interpretation.
+Code for the paper *Zonotopic Analysis of Quantization Error in Neural Networks*.
 
-## Overview
+Given a ReLU network, its fixed-point quantized counterpart and a box of inputs, the
+code computes sound bounds on the quantization error `f_QNN(x) − f_DNN(x)`. Both
+networks are propagated through zonotope transformers (ReLU for the original network,
+a combined round-clamp transformer for the quantized one) and the output zonotopes are
+subtracted.
 
-This package implements a novel approach for computing tight over-approximations of quantization error in neural networks. Unlike existing methods that rely on expensive MILP solvers, our approach uses abstract interpretation with zonotopes to propagate quantization error through the network efficiently while maintaining soundness.
+Three variants are available:
 
-### Key Features
-
-- **Sound verification**: Provides guaranteed over-approximations of quantization error
-- **Efficient computation**: Significantly faster than MILP-based methods (e.g., QEBVerif)
-- **Comparable tightness**: Achieves interval tightness comparable to existing approaches like DRA
-- **Flexible quantization**: Supports various bit-widths and scaling factors for inputs, weights, biases, and activations
-
-## Algorithm
-
-The core algorithm maintains three zonotopes per layer during forward propagation:
-
-1. **Z**: Exact (real-valued) intermediate values
-2. **Z_hat**: Quantized intermediate values
-3. **Z_tilda**: Quantization error (difference between quantized and exact)
-
-For each layer, the algorithm:
-- Propagates through affine transformations using both real and quantized weights/biases
-- Applies abstract ReLU or round-clamp operations
-- Accumulates quantization error using custom abstract transformations
-
-The final output is a zonotope over-approximating the quantization error bounds.
+| Variant | What it does |
+|---|---|
+| Zonotope | Plain zonotope propagation, no LP |
+| Constrained (light) | Adds two box constraints per unstable neuron and solves LPs with HiGHS. This is the main method of the paper. |
+| Constrained (complete) | Also adds the remaining convex-hull constraints of the round-clamp relaxation |
 
 ## Installation
 
-### Prerequisites
-
-- Julia 1.6 or higher
-- Required Julia packages (see `Project.toml`):
-  - LazySets
-  - ModelVerification
-  - JSON3
-  - LinearAlgebra
-  - IterTools
-
-### Quick Setup
+Tested with Julia 1.12 (the versions in `Manifest.toml` are pinned for it).
 
 ```bash
-# Clone the repository
-git clone https://github.com/Robert-Debbas/zonotopes.git
-cd QuantizedZonotopeVerification
-
-# Install dependencies
+git clone --recurse-submodules https://github.com/robertdebbas/zonotopes.git
+cd zonotopes
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 ```
 
-**Note:** Network files and baseline implementations are not included in the repository (gitignored). To run the ACAS Xu benchmarks, you'll need to:
+`ModelVerification.jl/` is a small local package that defines the `Network` and
+`Layer` types. `QEBVerif/` is a git submodule and is only needed for the ACAS Xu
+weights and the DRA-Sym baseline.
 
-1. **Obtain ACAS Xu networks**: Available from [NeuralVerification.jl](https://github.com/sisl/NeuralVerification.jl/tree/master/examples/ACASXu)
-2. **Convert to JSON format**: Networks should be in `networks/acasxu_X_Y.json` format (see `src/utils/network_io.jl` for expected structure)
-3. **Optional - QEBVerif baseline**: Clone from [QEBVerif repo](https://github.com/Lawepwasd/QEBVerif) for comparison
+## Quick check
 
-Without networks, you can still:
-- Run unit tests: `julia --project=. test/runtests.jl`
-- Test on synthetic networks (see `test/test_network.jl`)
-- Use your own network files
+Neither command needs network files.
+
+```bash
+julia --project=. test/runtests.jl
+julia --project=. examples/small_example.jl
+```
+
+The example bounds the quantization error of a small synthetic network and prints:
+
+```
+zonotope:    [-0.2040218505859376] [0.24231811523437488]
+constrained: [-0.1730312500000001] [0.19828124999999988]
+```
 
 ## Usage
 
-### Basic Example
+The repository is not a registered package, so load the module with `include`
+(see `examples/small_example.jl` for a complete script):
 
 ```julia
-using QuantizedZonotopeVerification
-using LinearAlgebra
+include("src/QuantizedZonotopeVerification.jl")
+using .QuantizedZonotopeVerification
+using LazySets, LinearAlgebra
 
-# Load a network
-net = load_acasxu_network_from_json("networks/acasxu_2_5.json")
+net = load_acasxu_network_from_json("networks/acasxu_1_1.json")
 
-# Configure quantization parameters
+# (signedness tag, total bits, fractional bits)
 quant_config = Dict(
-    :input => ("pm", 8, 8),           # Plus-minus, 8 bits, 8 fractional bits
-    :weights => ("pm", 8, 6),         # 8 bits total, 6 fractional bits
-    :biases => ("pm", 8, 6),
-    :activations => ("p", 8, 6)       # Positive only (ReLU output)
+    :input       => ("pm", 8, 8),
+    :weights     => ("pm", 6, 4),
+    :biases      => ("pm", 6, 4),
+    :activations => ("p",  6, 4),
 )
 
-# Define input region as a zonotope
-input_center = [0.0, 0.0, 0.0, 0.0, 0.0]
-attack_radius = 0.1
-input_zono = Zonotope(input_center, attack_radius * I(5))
+input_zono = Zonotope(fill(-0.3, 5), 0.01 * Matrix(1.0I, 5, 5))
 
-# Compute quantization error zonotope
+# Plain zonotope: returns the error zonotope
 error_zono = quantization_error_zonotope(net, quant_config, input_zono)
-
-# Extract interval bounds
 box = overapproximate(error_zono, Hyperrectangle)
-lower_bounds = box.center .- box.radius
-upper_bounds = box.center .+ box.radius
 
-println("Quantization error bounds:")
-println("Lower: ", lower_bounds)
-println("Upper: ", upper_bounds)
+# Constrained (light): returns lower and upper bound vectors
+lb, ub = quantization_error_zonotope(net, quant_config, input_zono;
+             constrained=true, full_constraints=false, diagonal_constraints=false)
+
+# Constrained (complete)
+lb, ub = quantization_error_zonotope(net, quant_config, input_zono; constrained=true)
 ```
 
-### Quantization Configuration
+Weights, biases and inputs are quantized as signed fixed-point values and hidden
+activations as unsigned ones; the signedness tag in `quant_config` is not read.
+Rounding is to nearest with ties to even. The constrained variants expect a box-shaped
+input zonotope with one generator per input dimension.
 
-The `quant_config` dictionary specifies quantization parameters:
+## Reproducing the experiments
 
-```julia
-quant_config = Dict(
-    :input => (strategy, bits, scaling),
-    :weights => (strategy, bits, scaling),
-    :biases => (strategy, bits, scaling),
-    :activations => (strategy, bits, scaling)
-)
-```
+All commands are run from the repository root.
 
-- **strategy**: `"p"` (positive only: [0, 2^bits-1]) or `"pm"` (plus-minus: [-2^(bits-1), 2^(bits-1)-1])
-- **bits**: Total bit-width
-- **scaling**: Number of fractional bits (scaling factor = 2^scaling)
-
-## Experiments
-
-### Running Benchmarks
+**1. ACAS Xu networks.** The benchmarks read `networks/acasxu_<i>_<j>.json`. Generate
+these files from the weights in the QEBVerif submodule (requires `h5py`):
 
 ```bash
-# Run all benchmarks
-cd benchmarks
-julia --project=.. run_all_benchmarks.jl
-
-# Or run individual benchmarks
-julia --project=.. acasxu_experiments.jl
-julia --project=.. comparison_with_sampling.jl
+python benchmarks/convert_networks.py
 ```
 
-### Benchmark Details
+**2. Zonotope methods.** 150 experiments: 10 networks × Q ∈ {6, 8, 10} × r ∈ {3, 6, 13, 19, 26},
+a few minutes in total.
 
-The `benchmarks/` directory contains comprehensive experiments:
-
-- **acasxu_experiments.jl**: Main verification using zonotope-based method on ACAS Xu networks
-- **comparison_with_sampling.jl**: Random sampling baseline for comparison
-- **run_all_benchmarks.jl**: Run complete benchmark suite
-
-See `benchmarks/README.md` for detailed documentation on running and customizing experiments.
-
-### Typical Configuration
-
-Experiments use:
-- **Networks**: ACAS Xu collision avoidance networks (various sizes)
-- **Quantization**: 6-8 bits with different scaling factors
-- **Input regions**: Fixed points with small perturbation radii (0.01-0.1)
-- **Baseline comparison**: Random sampling and QEBVerif DRA (Python, in `QEBVerif/`)
-
-Results are saved to `results/data/` and visualizations to `results/figures/`
-
-## Method Comparison
-
-| Method | Type | Soundness | Efficiency | Tightness |
-|--------|------|-----------|------------|-----------|
-| **Ours (Zonotope)** | Abstract Interpretation | Sound (over-approx) | Fast | Comparable to DRA |
-| QEBVerif DRA | Abstract Interpretation | Sound (over-approx) | Fast | Reference |
-| QEBVerif MILP | Optimization | Sound & Complete | Slow (requires Gurobi) | Tight |
-| Random Sampling | Monte Carlo | Unsound (under-approx) | Fast | Optimistic |
-
-### Key Advantages
-
-1. **No solver dependency**: Unlike QEBVerif's MILP approach, doesn't require Gurobi license
-2. **Efficient**: Comparable runtime to DRA, much faster than MILP
-3. **Sound**: Provides guaranteed over-approximations (unlike random sampling)
-4. **Comparable tightness**: Achieves similar interval widths to DRA in most cases
-
-## Project Structure
-
-```
-QuantizedZonotopeVerification/
-├── README.md                          # This file
-├── src/
-│   ├── QuantizedZonotopeVerification.jl  # Main module
-│   ├── core/
-│   │   ├── quantized_propagation.jl   # Core algorithm (quantization_error_zonotope)
-│   │   ├── abstractions.jl            # Abstract ReLU and round-clamp operations
-│   │   ├── quantization.jl            # Quantization utilities
-│   │   └── sampling.jl                # Sampling baseline and propagation
-│   └── utils/
-│       ├── conversions.jl             # Box/zonotope conversions
-│       └── network_io.jl              # Network loading utilities
-├── benchmarks/                        # Experimental evaluation
-│   ├── acasxu_experiments.jl         # Main ACAS Xu experiments
-│   ├── comparison_with_sampling.jl   # Sampling baseline comparison
-│   ├── run_all_benchmarks.jl         # Run all benchmarks
-│   └── README.md                     # Benchmark documentation
-├── results/                           # Experimental results
-│   ├── data/                         # CSV/JSON result files
-│   └── figures/                      # Plots and visualizations
-├── test/                             # Unit tests (if any)
-├── networks/                         # ACAS Xu networks (gitignored)
-├── QEBVerif/                        # QEBVerif baseline (gitignored)
-└── ModelVerification.jl/            # ModelVerification.jl submodule (gitignored)
+```bash
+julia --project=. benchmarks/collect_data.jl
 ```
 
-## Implementation Details
+This overwrites `results/data/benchmark_results.csv`. The bound values are
+deterministic; the timings depend on the machine. Each LP has a 2-second limit, and an
+LP that does not finish falls back to the plain zonotope bound for that output, so a
+heavily loaded machine can produce looser constrained bounds.
 
-### Core Functions
+**3. DRA-Sym baseline.** Needs a Python environment with TensorFlow 2, `gurobipy` and
+a Gurobi license (see `QEBVerif/README.md`).
 
-Located in `src/core/`:
-
-- **`quantization_error_zonotope`** (`quantized_propagation.jl`): Main verification algorithm
-- **`abstract_relu_triplet`** (`abstractions.jl`): Abstract ReLU in triplet form (λ, μ, E)
-- **`abstract_round_clamp_triplet`** (`abstractions.jl`): Abstract round-and-clamp for quantized activations
-- **`quantize_tensor`** (`quantization.jl`): Fixed-point quantization for scalars/tensors
-- **`sample_error_bounds`** (`sampling.jl`): Monte Carlo sampling baseline
-
-### Utility Functions
-
-Located in `src/utils/`:
-
-- **`load_acasxu_network_from_json`** (`network_io.jl`): Load networks from JSON
-- **`box_to_zonotope`, `zonotope_to_box`** (`conversions.jl`): Set conversions
-
-### Technical Notes
-
-- Zonotopes represented using center-generator form from LazySets.jl
-- Abstract transformations decomposed into diagonal scaling + bias + error term
-- Quantization uses round-to-nearest with symmetric clamping
-- Networks loaded from JSON must follow ModelVerification.jl format
-
-## Related Work
-
-This work builds upon:
-
-- **ModelVerification.jl**: Julia package for neural network verification
-- **QEBVerif** (Zhang et al., CAV 2023): Quantization error bound verification using DRA and MILP
-- **LazySets.jl**: Julia library for lazy set representations
-
-## Citation
-
-If you use this code, please cite:
-
-```bibtex
-@software{quantized_zonotope_verification,
-  title = {Quantized Zonotope Verification},
-  author = {Debbas, Robert},
-  year = {2024},
-  url = {https://github.com/...}
-}
+```bash
+python benchmarks/collect_drasym_official.py
 ```
 
-### Related Publications
+This writes `results/data/drasym_results.csv`.
 
-- Zhang, Y., Song, F., Sun, J.: *QEBVerif: Quantization Error Bound Verification of Neural Networks*. CAV 2023.
+**4. Figures** (requires `pandas` and `matplotlib`), written to `results/figures/`:
+
+```bash
+python benchmarks/plot_results.py
+```
+
+**5. Ablations.** Both scripts print their tables to the terminal.
+
+```bash
+julia --project=. ablations/light_vs_complete.jl   # light vs. complete constraints
+julia --project=. ablations/mink_vs_shared.jl      # independent vs. shared input symbols
+```
+
+## Results
+
+ACAS Xu, 150 experiments, on an Apple M5 CPU. ODiff is the mean width of the error
+interval over the 5 outputs. The per-experiment values behind these tables are in
+`results/data/benchmark_results.csv` and `results/data/drasym_results.csv`.
+
+| Method | Avg ODiff | Avg time (s) |
+|---|---|---|
+| Zonotope | 361.1 | 0.002 |
+| Constrained (light) | 230.0 | 0.382 |
+| Constrained (complete) | 230.0 | 0.607 |
+| DRA-Sym (QEBVerif) | 145.3 | 0.564 |
+
+Small radii only (r = 3, 6):
+
+| Method | Avg ODiff | Avg time (s) |
+|---|---|---|
+| Zonotope | 4.99 | 0.001 |
+| Constrained (light) | 3.03 | 0.132 |
+| Constrained (complete) | 3.02 | 0.244 |
+| DRA-Sym (QEBVerif) | 11.69 | 0.454 |
+
+At small radii the constrained variants give tighter bounds than DRA-Sym in less time;
+at larger radii DRA-Sym is tighter.
+
+## Repository layout
+
+```
+src/
+  QuantizedZonotopeVerification.jl   module and exports
+  core/abstractions.jl               abstract_relu, abstract_round_clamp
+  core/propagation.jl                network propagation, constraints, LP bounds
+  core/quantization.jl               quantize_tensor, quantize_zonotope
+  core/sampling.jl                   concrete forward passes, sampled error range
+  utils/                             box/zonotope conversions, network loading
+examples/small_example.jl            small synthetic example
+test/                                unit and end-to-end tests
+benchmarks/                          benchmark, baseline, conversion and plotting scripts
+ablations/                           the two ablation studies
+results/                             output CSVs and figures
+ModelVerification.jl/                local package with the Network and Layer types
+QEBVerif/                            baseline (git submodule)
+```
 
 ## License
 
-[Specify license here]
+The code in this repository is released under the MIT License (see `LICENSE`).
 
-## Contact
+QEBVerif, linked as a git submodule, is a separate project by its own authors and is
+not covered by this license. It is only needed for the ACAS Xu weights and the DRA-Sym
+baseline; see its repository for its terms of use.
 
-For questions or issues, please contact [contact information].
+## Citation
 
-## Acknowledgments
-
-This work was developed with guidance from [advisors/collaborators].
+```bibtex
+@misc{debbas2026zonotopic,
+  title  = {Zonotopic Analysis of Quantization Error in Neural Networks},
+  author = {Debbas, Robert and Goubault, Eric and Putot, Sylvie},
+  year   = {2026},
+  note   = {arXiv preprint}
+}
+```
